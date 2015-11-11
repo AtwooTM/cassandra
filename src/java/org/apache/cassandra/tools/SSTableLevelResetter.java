@@ -17,19 +17,19 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.IOException;
 import java.io.PrintStream;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * Reset level to 0 on a given set of sstables
@@ -39,7 +39,7 @@ public class SSTableLevelResetter
     /**
      * @param args a list of sstables whose metadata we are changing
      */
-    public static void main(String[] args) throws IOException
+    public static void main(String[] args)
     {
         PrintStream out = System.out;
         if (args.length == 0)
@@ -57,12 +57,14 @@ public class SSTableLevelResetter
             System.exit(1);
         }
 
+        Util.initDatabaseDescriptor();
+
         // TODO several daemon threads will run from here.
         // So we have to explicitly call System.exit.
         try
         {
             // load keyspace descriptions.
-            DatabaseDescriptor.loadSchemas();
+            Schema.instance.loadFromDisk(false);
 
             String keyspaceName = args[1];
             String columnfamily = args[2];
@@ -76,7 +78,7 @@ public class SSTableLevelResetter
             Keyspace keyspace = Keyspace.openWithoutSSTables(keyspaceName);
             ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(columnfamily);
             boolean foundSSTable = false;
-            for (Map.Entry<Descriptor, Set<Component>> sstable : cfs.directories.sstableLister().list().entrySet())
+            for (Map.Entry<Descriptor, Set<Component>> sstable : cfs.getDirectories().sstableLister(Directories.OnTxnErr.THROW).list().entrySet())
             {
                 if (sstable.getValue().contains(Component.STATS))
                 {
@@ -100,9 +102,10 @@ public class SSTableLevelResetter
                 out.println("Found no sstables, did you give the correct keyspace/table?");
             }
         }
-        catch (Throwable e)
+        catch (Throwable t)
         {
-            e.printStackTrace();
+            JVMStabilityInspector.inspectThrowable(t);
+            t.printStackTrace();
             System.exit(1);
         }
         System.exit(0);

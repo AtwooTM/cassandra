@@ -21,13 +21,7 @@ package org.apache.cassandra.stress.settings;
  */
 
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.HashMap;
+import java.util.*;
 
 
 public final class OptionAnyProbabilities extends OptionMulti
@@ -48,7 +42,7 @@ public final class OptionAnyProbabilities extends OptionMulti
             String[] args = param.split("=");
             if (args.length == 2 && args[1].length() > 0 && args[0].length() > 0)
             {
-                if (options.put(args[0], Double.parseDouble(args[1])) != null)
+                if (options.put(args[0], Double.valueOf(args[1])) != null)
                     throw new IllegalArgumentException(args[0] + " set twice");
                 return true;
             }
@@ -78,6 +72,11 @@ public final class OptionAnyProbabilities extends OptionMulti
         boolean setByUser()
         {
             return !options.isEmpty();
+        }
+
+        boolean present()
+        {
+            return setByUser();
         }
     }
 

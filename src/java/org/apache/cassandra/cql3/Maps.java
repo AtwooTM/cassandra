@@ -17,24 +17,24 @@
  */
 package org.apache.cassandra.cql3;
 
+import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
+
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.composites.CellName;
-import org.apache.cassandra.db.composites.Composite;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
@@ -47,15 +47,15 @@ public abstract class Maps
 
     public static ColumnSpecification keySpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("key(" + column.name + ")", true), ((MapType)column.type).keys);
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("key(" + column.name + ")", true), ((MapType)column.type).getKeysType());
     }
 
     public static ColumnSpecification valueSpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((MapType)column.type).values);
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((MapType)column.type).getValuesType());
     }
 
-    public static class Literal implements Term.Raw
+    public static class Literal extends Term.Raw
     {
         public final List<Pair<Term.Raw, Term.Raw>> entries;
 
@@ -70,7 +70,7 @@ public abstract class Maps
 
             ColumnSpecification keySpec = Maps.keySpecOf(receiver);
             ColumnSpecification valueSpec = Maps.valueSpecOf(receiver);
-            Map<Term, Term> values = new HashMap<Term, Term>(entries.size());
+            Map<Term, Term> values = new HashMap<>(entries.size());
             boolean allTerminal = true;
             for (Pair<Term.Raw, Term.Raw> entry : entries)
             {
@@ -78,58 +78,63 @@ public abstract class Maps
                 Term v = entry.right.prepare(keyspace, valueSpec);
 
                 if (k.containsBindMarker() || v.containsBindMarker())
-                    throw new InvalidRequestException(String.format("Invalid map literal for %s: bind variables are not supported inside collection literals", receiver));
+                    throw new InvalidRequestException(String.format("Invalid map literal for %s: bind variables are not supported inside collection literals", receiver.name));
 
                 if (k instanceof Term.NonTerminal || v instanceof Term.NonTerminal)
                     allTerminal = false;
 
                 values.put(k, v);
             }
-            DelayedValue value = new DelayedValue(((MapType)receiver.type).keys, values);
+            DelayedValue value = new DelayedValue(((MapType)receiver.type).getKeysType(), values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
         private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
             if (!(receiver.type instanceof MapType))
-                throw new InvalidRequestException(String.format("Invalid map literal for %s of type %s", receiver, receiver.type.asCQL3Type()));
+                throw new InvalidRequestException(String.format("Invalid map literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
 
             ColumnSpecification keySpec = Maps.keySpecOf(receiver);
             ColumnSpecification valueSpec = Maps.valueSpecOf(receiver);
             for (Pair<Term.Raw, Term.Raw> entry : entries)
             {
-                if (!entry.left.isAssignableTo(keyspace, keySpec))
-                    throw new InvalidRequestException(String.format("Invalid map literal for %s: key %s is not of type %s", receiver, entry.left, keySpec.type.asCQL3Type()));
-                if (!entry.right.isAssignableTo(keyspace, valueSpec))
-                    throw new InvalidRequestException(String.format("Invalid map literal for %s: value %s is not of type %s", receiver, entry.right, valueSpec.type.asCQL3Type()));
+                if (!entry.left.testAssignment(keyspace, keySpec).isAssignable())
+                    throw new InvalidRequestException(String.format("Invalid map literal for %s: key %s is not of type %s", receiver.name, entry.left, keySpec.type.asCQL3Type()));
+                if (!entry.right.testAssignment(keyspace, valueSpec).isAssignable())
+                    throw new InvalidRequestException(String.format("Invalid map literal for %s: value %s is not of type %s", receiver.name, entry.right, valueSpec.type.asCQL3Type()));
             }
         }
 
-        public boolean isAssignableTo(String keyspace, ColumnSpecification receiver)
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            try
+            if (!(receiver.type instanceof MapType))
+                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
+            // If there is no elements, we can't say it's an exact match (an empty map if fundamentally polymorphic).
+            if (entries.isEmpty())
+                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+            ColumnSpecification keySpec = Maps.keySpecOf(receiver);
+            ColumnSpecification valueSpec = Maps.valueSpecOf(receiver);
+            // It's an exact match if all are exact match, but is not assignable as soon as any is non assignable.
+            AssignmentTestable.TestResult res = AssignmentTestable.TestResult.EXACT_MATCH;
+            for (Pair<Term.Raw, Term.Raw> entry : entries)
             {
-                validateAssignableTo(keyspace, receiver);
-                return true;
+                AssignmentTestable.TestResult t1 = entry.left.testAssignment(keyspace, keySpec);
+                AssignmentTestable.TestResult t2 = entry.right.testAssignment(keyspace, valueSpec);
+                if (t1 == AssignmentTestable.TestResult.NOT_ASSIGNABLE || t2 == AssignmentTestable.TestResult.NOT_ASSIGNABLE)
+                    return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+                if (t1 != AssignmentTestable.TestResult.EXACT_MATCH || t2 != AssignmentTestable.TestResult.EXACT_MATCH)
+                    res = AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
             }
-            catch (InvalidRequestException e)
-            {
-                return false;
-            }
+            return res;
         }
 
-        @Override
-        public String toString()
+        public String getText()
         {
-            StringBuilder sb = new StringBuilder();
-            sb.append("{");
-            for (int i = 0; i < entries.size(); i++)
-            {
-                if (i > 0) sb.append(", ");
-                sb.append(entries.get(i).left).append(":").append(entries.get(i).right);
-            }
-            sb.append("}");
-            return sb.toString();
+            return entries.stream()
+                    .map(entry -> String.format("%s: %s", entry.left.getText(), entry.right.getText()))
+                    .collect(Collectors.joining(", ", "{", "}"));
         }
     }
 
@@ -148,10 +153,10 @@ public abstract class Maps
             {
                 // Collections have this small hack that validate cannot be called on a serialized object,
                 // but compose does the validation (so we're fine).
-                Map<?, ?> m = (Map<?, ?>)type.getSerializer().deserializeForNativeProtocol(value, version);
-                Map<ByteBuffer, ByteBuffer> map = new LinkedHashMap<ByteBuffer, ByteBuffer>(m.size());
+                Map<?, ?> m = type.getSerializer().deserializeForNativeProtocol(value, version);
+                Map<ByteBuffer, ByteBuffer> map = new LinkedHashMap<>(m.size());
                 for (Map.Entry<?, ?> entry : m.entrySet())
-                    map.put(type.keys.decompose(entry.getKey()), type.values.decompose(entry.getValue()));
+                    map.put(type.getKeysType().decompose(entry.getKey()), type.getValuesType().decompose(entry.getValue()));
                 return new Value(map);
             }
             catch (MarshalException e)
@@ -160,15 +165,15 @@ public abstract class Maps
             }
         }
 
-        public ByteBuffer get(QueryOptions options)
+        public ByteBuffer get(int protocolVersion)
         {
-            List<ByteBuffer> buffers = new ArrayList<ByteBuffer>(2 * map.size());
+            List<ByteBuffer> buffers = new ArrayList<>(2 * map.size());
             for (Map.Entry<ByteBuffer, ByteBuffer> entry : map.entrySet())
             {
                 buffers.add(entry.getKey());
                 buffers.add(entry.getValue());
             }
-            return CollectionSerializer.pack(buffers, map.size(), options.getProtocolVersion());
+            return CollectionSerializer.pack(buffers, map.size(), protocolVersion);
         }
 
         public boolean equals(MapType mt, Value v)
@@ -183,7 +188,7 @@ public abstract class Maps
             {
                 Map.Entry<ByteBuffer, ByteBuffer> thisEntry = thisIter.next();
                 Map.Entry<ByteBuffer, ByteBuffer> thatEntry = thatIter.next();
-                if (mt.keys.compare(thisEntry.getKey(), thatEntry.getKey()) != 0 || mt.values.compare(thisEntry.getValue(), thatEntry.getValue()) != 0)
+                if (mt.getKeysType().compare(thisEntry.getKey(), thatEntry.getKey()) != 0 || mt.getValuesType().compare(thisEntry.getValue(), thatEntry.getValue()) != 0)
                     return false;
             }
 
@@ -213,7 +218,7 @@ public abstract class Maps
         {
         }
 
-        public Value bind(QueryOptions options) throws InvalidRequestException
+        public Terminal bind(QueryOptions options) throws InvalidRequestException
         {
             Map<ByteBuffer, ByteBuffer> buffers = new TreeMap<ByteBuffer, ByteBuffer>(comparator);
             for (Map.Entry<Term, Term> entry : elements.entrySet())
@@ -222,6 +227,8 @@ public abstract class Maps
                 ByteBuffer keyBytes = entry.getKey().bindAndGet(options);
                 if (keyBytes == null)
                     throw new InvalidRequestException("null is not supported inside collections");
+                if (keyBytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                    throw new InvalidRequestException("unset value is not supported for map keys");
                 if (keyBytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
                     throw new InvalidRequestException(String.format("Map key is too long. Map keys are limited to %d bytes but %d bytes keys provided",
                                                                     FBUtilities.MAX_UNSIGNED_SHORT,
@@ -230,6 +237,9 @@ public abstract class Maps
                 ByteBuffer valueBytes = entry.getValue().bindAndGet(options);
                 if (valueBytes == null)
                     throw new InvalidRequestException("null is not supported inside collections");
+                if (valueBytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                    return UNSET_VALUE;
+
                 if (valueBytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
                     throw new InvalidRequestException(String.format("Map value is too long. Map values are limited to %d bytes but %d bytes value provided",
                                                                     FBUtilities.MAX_UNSIGNED_SHORT,
@@ -238,6 +248,12 @@ public abstract class Maps
                 buffers.put(keyBytes, valueBytes);
             }
             return new Value(buffers);
+        }
+
+        public Iterable<Function> getFunctions()
+        {
+            return Iterables.concat(Terms.getFunctions(elements.keySet()),
+                                    Terms.getFunctions(elements.values()));
         }
     }
 
@@ -249,10 +265,14 @@ public abstract class Maps
             assert receiver.type instanceof MapType;
         }
 
-        public Value bind(QueryOptions options) throws InvalidRequestException
+        public Terminal bind(QueryOptions options) throws InvalidRequestException
         {
             ByteBuffer value = options.getValues().get(bindIndex);
-            return value == null ? null : Value.fromSerialized(value, (MapType)receiver.type, options.getProtocolVersion());
+            if (value == null)
+                return null;
+            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return UNSET_VALUE;
+            return Value.fromSerialized(value, (MapType)receiver.type, options.getProtocolVersion());
         }
     }
 
@@ -263,12 +283,16 @@ public abstract class Maps
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
+            Term.Terminal value = t.bind(params.options);
+            if (value == UNSET_VALUE)
+                return;
+
             // delete + put
-            CellName name = cf.getComparator().create(prefix, column);
-            cf.addAtom(params.makeTombstoneForOverwrite(name.slice()));
-            Putter.doPut(t, cf, prefix, column, params);
+            if (column.type.isMultiCell())
+                params.setComplexDeletionTimeForOverwrite(column);
+            Putter.doPut(value, column, params);
         }
     }
 
@@ -289,20 +313,23 @@ public abstract class Maps
             k.collectMarkerSpecification(boundNames);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
+            assert column.type.isMultiCell() : "Attempted to set a value for a single key on a frozen map";
             ByteBuffer key = k.bindAndGet(params.options);
             ByteBuffer value = t.bindAndGet(params.options);
             if (key == null)
                 throw new InvalidRequestException("Invalid null map key");
+            if (key == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new InvalidRequestException("Invalid unset map key");
 
-            CellName cellName = cf.getComparator().create(prefix, column, key);
+            CellPath path = CellPath.create(key);
 
             if (value == null)
             {
-                cf.addColumn(params.makeTombstone(cellName));
+                params.addTombstone(column, path);
             }
-            else
+            else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER)
             {
                 // We don't support value > 64K because the serialization format encode the length as an unsigned short.
                 if (value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
@@ -310,7 +337,7 @@ public abstract class Maps
                                                                     FBUtilities.MAX_UNSIGNED_SHORT,
                                                                     value.remaining()));
 
-                cf.addColumn(params.makeColumn(cellName, value));
+                params.addCell(column, path, value);
             }
         }
     }
@@ -322,23 +349,32 @@ public abstract class Maps
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            doPut(t, cf, prefix, column, params);
+            assert column.type.isMultiCell() : "Attempted to add items to a frozen map";
+            Term.Terminal value = t.bind(params.options);
+            if (value != UNSET_VALUE)
+                doPut(value, column, params);
         }
 
-        static void doPut(Term t, ColumnFamily cf, Composite prefix, ColumnDefinition column, UpdateParameters params) throws InvalidRequestException
+        static void doPut(Term.Terminal value, ColumnDefinition column, UpdateParameters params) throws InvalidRequestException
         {
-            Term.Terminal value = t.bind(params.options);
-            if (value == null)
-                return;
-            assert value instanceof Maps.Value;
-
-            Map<ByteBuffer, ByteBuffer> toAdd = ((Maps.Value)value).map;
-            for (Map.Entry<ByteBuffer, ByteBuffer> entry : toAdd.entrySet())
+            if (column.type.isMultiCell())
             {
-                CellName cellName = cf.getComparator().create(prefix, column, entry.getKey());
-                cf.addColumn(params.makeColumn(cellName, entry.getValue()));
+                if (value == null)
+                    return;
+
+                Map<ByteBuffer, ByteBuffer> elements = ((Value) value).map;
+                for (Map.Entry<ByteBuffer, ByteBuffer> entry : elements.entrySet())
+                    params.addCell(column, CellPath.create(entry.getKey()), entry.getValue());
+            }
+            else
+            {
+                // for frozen maps, we're overwriting the whole cell
+                if (value == null)
+                    params.addTombstone(column);
+                else
+                    params.addCell(column, value.get(Server.CURRENT_VERSION));
             }
         }
     }
@@ -350,15 +386,16 @@ public abstract class Maps
             super(column, k);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
+            assert column.type.isMultiCell() : "Attempted to delete a single key in a frozen map";
             Term.Terminal key = t.bind(params.options);
             if (key == null)
                 throw new InvalidRequestException("Invalid null map key");
-            assert key instanceof Constants.Value;
+            if (key == Constants.UNSET_VALUE)
+                throw new InvalidRequestException("Invalid unset map key");
 
-            CellName cellName = cf.getComparator().create(prefix, column, ((Constants.Value)key).bytes);
-            cf.addColumn(params.makeTombstone(cellName));
+            params.addTombstone(column, CellPath.create(key.get(params.options.getProtocolVersion())));
         }
     }
 }

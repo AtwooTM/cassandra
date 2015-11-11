@@ -15,27 +15,41 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.locator;
 
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
-import org.apache.cassandra.utils.FBUtilities;
+import com.google.common.net.InetAddresses;
+import org.junit.Assert;
 import org.junit.Test;
+
+import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Unit tests for {@link GossipingPropertyFileSnitch}.
  */
 public class GossipingPropertyFileSnitchTest
 {
+    public static void checkEndpoint(final AbstractNetworkTopologySnitch snitch,
+                                     final String endpointString, final String expectedDatacenter,
+                                     final String expectedRack)
+    {
+        final InetAddress endpoint = InetAddresses.forString(endpointString);
+        Assert.assertEquals(expectedDatacenter, snitch.getDatacenter(endpoint));
+        Assert.assertEquals(expectedRack, snitch.getRack(endpoint));
+    }
+
     @Test
     public void testAutoReloadConfig() throws Exception
     {
         String confFile = FBUtilities.resourceToFile(SnitchProperties.RACKDC_PROPERTY_FILENAME);
         
         final GossipingPropertyFileSnitch snitch = new GossipingPropertyFileSnitch(/*refreshPeriodInSeconds*/1);
-        YamlFileNetworkTopologySnitchTest.checkEndpoint(snitch, FBUtilities.getBroadcastAddress().getHostAddress(), "DC1", "RAC1");
+        checkEndpoint(snitch, FBUtilities.getBroadcastAddress().getHostAddress(), "DC1", "RAC1");
 
         final Path effectiveFile = Paths.get(confFile);
         final Path backupFile = Paths.get(confFile + ".bak");
@@ -48,7 +62,7 @@ public class GossipingPropertyFileSnitchTest
             
             Thread.sleep(1500);
             
-            YamlFileNetworkTopologySnitchTest.checkEndpoint(snitch, FBUtilities.getBroadcastAddress().getHostAddress(), "DC2", "RAC2");
+            checkEndpoint(snitch, FBUtilities.getBroadcastAddress().getHostAddress(), "DC2", "RAC2");
         }
         finally
         {

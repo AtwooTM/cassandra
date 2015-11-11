@@ -18,14 +18,20 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cql3.Term.MultiColumnRaw;
+import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
  * Static helper methods and classes for tuples.
@@ -48,7 +54,7 @@ public class Tuples
      * A raw, literal tuple.  When prepared, this will become a Tuples.Value or Tuples.DelayedValue, depending
      * on whether the tuple holds NonTerminals.
      */
-    public static class Literal implements Term.MultiColumnRaw
+    public static class Literal extends Term.MultiColumnRaw
     {
         private final List<Term.Raw> elements;
 
@@ -110,28 +116,27 @@ public class Tuples
 
                 Term.Raw value = elements.get(i);
                 ColumnSpecification spec = componentSpecOf(receiver, i);
-                if (!value.isAssignableTo(keyspace, spec))
+                if (!value.testAssignment(keyspace, spec).isAssignable())
                     throw new InvalidRequestException(String.format("Invalid tuple literal for %s: component %d is not of type %s", receiver.name, i, spec.type.asCQL3Type()));
             }
         }
 
-        public boolean isAssignableTo(String keyspace, ColumnSpecification receiver)
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             try
             {
                 validateAssignableTo(keyspace, receiver);
-                return true;
+                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
             }
             catch (InvalidRequestException e)
             {
-                return false;
+                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
             }
         }
 
-        @Override
-        public String toString()
+        public String getText()
         {
-            return tupleToString(elements);
+            return elements.stream().map(Term.Raw::getText).collect(Collectors.joining(", ", "(", ")"));
         }
     }
 
@@ -152,7 +157,7 @@ public class Tuples
             return new Value(type.split(bytes));
         }
 
-        public ByteBuffer get(QueryOptions options)
+        public ByteBuffer get(int protocolVersion)
         {
             return TupleType.buildValue(elements);
         }
@@ -194,16 +199,13 @@ public class Tuples
 
         private ByteBuffer[] bindInternal(QueryOptions options) throws InvalidRequestException
         {
-            int version = options.getProtocolVersion();
-
             ByteBuffer[] buffers = new ByteBuffer[elements.size()];
             for (int i = 0; i < elements.size(); i++)
             {
                 buffers[i] = elements.get(i).bindAndGet(options);
-                // Inside tuples, we must force the serialization of collections to v3 whatever protocol
-                // version is in use since we're going to store directly that serialized value.
-                if (version < 3 && type.type(i).isCollection())
-                    buffers[i] = ((CollectionType)type.type(i)).getSerializer().reserializeToV3(buffers[i]);
+                // Since A tuple value is always written in its entirety Cassandra can't preserve a pre-existing value by 'not setting' the new value. Reject the query.
+                if (buffers[i] == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                    throw new InvalidRequestException(String.format("Invalid unset value for tuple field number %d", i));
             }
             return buffers;
         }
@@ -225,6 +227,11 @@ public class Tuples
         {
             return tupleToString(elements);
         }
+
+        public Iterable<Function> getFunctions()
+        {
+            return Terms.getFunctions(elements);
+        }
     }
 
     /**
@@ -240,21 +247,21 @@ public class Tuples
             this.elements = items;
         }
 
-        public static InValue fromSerialized(ByteBuffer value, ListType type) throws InvalidRequestException
+        public static InValue fromSerialized(ByteBuffer value, ListType type, QueryOptions options) throws InvalidRequestException
         {
             try
             {
                 // Collections have this small hack that validate cannot be called on a serialized object,
-                // but compose does the validation (so we're fine).
-                List<?> l = (List<?>)type.compose(value);
+                // but the deserialization does the validation (so we're fine).
+                List<?> l = type.getSerializer().deserializeForNativeProtocol(value, options.getProtocolVersion());
 
-                assert type.elements instanceof TupleType;
-                TupleType tupleType = (TupleType) type.elements;
+                assert type.getElementsType() instanceof TupleType;
+                TupleType tupleType = (TupleType) type.getElementsType();
 
                 // type.split(bytes)
                 List<List<ByteBuffer>> elements = new ArrayList<>(l.size());
                 for (Object element : l)
-                    elements.add(Arrays.asList(tupleType.split(type.elements.decompose(element))));
+                    elements.add(Arrays.asList(tupleType.split(type.getElementsType().decompose(element))));
                 return new InValue(elements);
             }
             catch (MarshalException e)
@@ -263,7 +270,7 @@ public class Tuples
             }
         }
 
-        public ByteBuffer get(QueryOptions options)
+        public ByteBuffer get(int protocolVersion)
         {
             throw new UnsupportedOperationException();
         }
@@ -276,16 +283,18 @@ public class Tuples
 
     /**
      * A raw placeholder for a tuple of values for different multiple columns, each of which may have a different type.
+     * {@code
      * For example, "SELECT ... WHERE (col1, col2) > ?".
+     * }
      */
-    public static class Raw extends AbstractMarker.Raw implements Term.MultiColumnRaw
+    public static class Raw extends AbstractMarker.MultiColumnRaw
     {
         public Raw(int bindIndex)
         {
             super(bindIndex);
         }
 
-        private static ColumnSpecification makeReceiver(List<? extends ColumnSpecification> receivers) throws InvalidRequestException
+        private static ColumnSpecification makeReceiver(List<? extends ColumnSpecification> receivers)
         {
             List<AbstractType<?>> types = new ArrayList<>(receivers.size());
             StringBuilder inName = new StringBuilder("(");
@@ -308,18 +317,12 @@ public class Tuples
         {
             return new Tuples.Marker(bindIndex, makeReceiver(receivers));
         }
-
-        @Override
-        public AbstractMarker prepare(String keyspace, ColumnSpecification receiver)
-        {
-            throw new AssertionError("Tuples.Raw.prepare() requires a list of receivers");
-        }
     }
 
     /**
      * A raw marker for an IN list of tuples, like "SELECT ... WHERE (a, b, c) IN ?"
      */
-    public static class INRaw extends AbstractMarker.Raw
+    public static class INRaw extends AbstractMarker.MultiColumnRaw
     {
         public INRaw(int bindIndex)
         {
@@ -337,31 +340,28 @@ public class Tuples
                 if (i < receivers.size() - 1)
                     inName.append(",");
 
-                if (receiver.type instanceof CollectionType)
-                    throw new InvalidRequestException("Collection columns do not support IN relations");
+                if (receiver.type.isCollection() && receiver.type.isMultiCell())
+                    throw new InvalidRequestException("Non-frozen collection columns do not support IN relations");
+
                 types.add(receiver.type);
             }
             inName.append(')');
 
             ColumnIdentifier identifier = new ColumnIdentifier(inName.toString(), true);
             TupleType type = new TupleType(types);
-            return new ColumnSpecification(receivers.get(0).ksName, receivers.get(0).cfName, identifier, ListType.getInstance(type));
+            return new ColumnSpecification(receivers.get(0).ksName, receivers.get(0).cfName, identifier, ListType.getInstance(type, false));
         }
 
         public AbstractMarker prepare(String keyspace, List<? extends ColumnSpecification> receivers) throws InvalidRequestException
         {
             return new InMarker(bindIndex, makeInReceiver(receivers));
         }
-
-        @Override
-        public AbstractMarker prepare(String keyspace, ColumnSpecification receiver)
-        {
-            throw new AssertionError("Tuples.INRaw.prepare() requires a list of receivers");
-        }
     }
 
     /**
+     * {@code
      * Represents a marker for a single tuple, like "SELECT ... WHERE (a, b, c) > ?"
+     * }
      */
     public static class Marker extends AbstractMarker
     {
@@ -373,6 +373,8 @@ public class Tuples
         public Value bind(QueryOptions options) throws InvalidRequestException
         {
             ByteBuffer value = options.getValues().get(bindIndex);
+            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new InvalidRequestException(String.format("Invalid unset value for tuple %s", receiver.name));
             return value == null ? null : Value.fromSerialized(value, (TupleType)receiver.type);
         }
     }
@@ -391,7 +393,9 @@ public class Tuples
         public InValue bind(QueryOptions options) throws InvalidRequestException
         {
             ByteBuffer value = options.getValues().get(bindIndex);
-            return value == null ? null : InValue.fromSerialized(value, (ListType)receiver.type);
+            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new InvalidRequestException(String.format("Invalid unset value for %s", receiver.name));
+            return value == null ? null : InValue.fromSerialized(value, (ListType)receiver.type, options);
         }
     }
 

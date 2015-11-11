@@ -21,26 +21,14 @@ package org.apache.cassandra.stress.settings;
  */
 
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.commons.math3.distribution.ExponentialDistribution;
-import org.apache.commons.math3.distribution.NormalDistribution;
-import org.apache.commons.math3.distribution.UniformRealDistribution;
-import org.apache.commons.math3.distribution.WeibullDistribution;
-import org.apache.commons.math3.random.JDKRandomGenerator;
+import com.google.common.base.Function;
 
-import org.apache.cassandra.stress.generate.Distribution;
-import org.apache.cassandra.stress.generate.DistributionBoundApache;
 import org.apache.cassandra.stress.generate.DistributionFactory;
-import org.apache.cassandra.stress.generate.DistributionFixed;
-import org.apache.cassandra.stress.generate.DistributionInverted;
-import org.apache.cassandra.stress.generate.DistributionOffsetApache;
 import org.apache.cassandra.stress.generate.RatioDistribution;
 import org.apache.cassandra.stress.generate.RatioDistributionFactory;
 
@@ -50,16 +38,29 @@ import org.apache.cassandra.stress.generate.RatioDistributionFactory;
 public class OptionRatioDistribution extends Option
 {
 
+    public static final Function<String, RatioDistributionFactory> BUILDER = new Function<String, RatioDistributionFactory>()
+    {
+        public RatioDistributionFactory apply(String s)
+        {
+            return get(s);
+        }
+    };
+
     private static final Pattern FULL = Pattern.compile("(.*)/([0-9]+[KMB]?)", Pattern.CASE_INSENSITIVE);
 
     final OptionDistribution delegate;
     private double divisor;
-
-    private static final RatioDistribution DEFAULT = new RatioDistribution(new DistributionFixed(1), 1);
+    final String defaultSpec;
 
     public OptionRatioDistribution(String prefix, String defaultSpec, String description)
     {
-        delegate = new OptionDistribution(prefix, defaultSpec, description);
+        this(prefix, defaultSpec, description, defaultSpec != null);
+    }
+
+    public OptionRatioDistribution(String prefix, String defaultSpec, String description, boolean required)
+    {
+        delegate = new OptionDistribution(prefix, null, description, required);
+        this.defaultSpec = defaultSpec;
     }
 
     @Override
@@ -74,15 +75,22 @@ public class OptionRatioDistribution extends Option
 
     public static RatioDistributionFactory get(String spec)
     {
-        OptionRatioDistribution opt = new OptionRatioDistribution("", "", "");
+        OptionRatioDistribution opt = new OptionRatioDistribution("", "", "", true);
         if (!opt.accept(spec))
-            throw new IllegalArgumentException();
+            throw new IllegalArgumentException("Invalid ratio definition: "+spec);
         return opt.get();
     }
 
     public RatioDistributionFactory get()
     {
-        return !delegate.setByUser() ? new DefaultFactory() : new DelegateFactory(delegate.get(), divisor);
+        if (delegate.setByUser())
+            return new DelegateFactory(delegate.get(), divisor);
+        if (defaultSpec == null)
+            return null;
+        OptionRatioDistribution sub = new OptionRatioDistribution("", null, null, true);
+        if (!sub.accept(defaultSpec))
+            throw new IllegalStateException("Invalid default spec: " + defaultSpec);
+        return sub.get();
     }
 
     @Override
@@ -116,6 +124,11 @@ public class OptionRatioDistribution extends Option
         return delegate.setByUser();
     }
 
+    boolean present()
+    {
+        return delegate.present();
+    }
+
     @Override
     public String shortDisplay()
     {
@@ -123,15 +136,6 @@ public class OptionRatioDistribution extends Option
     }
 
     // factories
-
-    private static final class DefaultFactory implements RatioDistributionFactory
-    {
-        @Override
-        public RatioDistribution get()
-        {
-            return DEFAULT;
-        }
-    }
 
     private static final class DelegateFactory implements RatioDistributionFactory
     {

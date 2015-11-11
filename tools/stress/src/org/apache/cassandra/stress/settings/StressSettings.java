@@ -25,11 +25,13 @@ import java.io.Serializable;
 import java.util.*;
 
 import com.datastax.driver.core.Metadata;
+import com.google.common.collect.ImmutableMap;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.stress.util.JavaDriverClient;
 import org.apache.cassandra.stress.util.SimpleThriftClient;
 import org.apache.cassandra.stress.util.SmartThriftClient;
 import org.apache.cassandra.stress.util.ThriftClient;
+import org.apache.cassandra.thrift.AuthenticationRequest;
 import org.apache.cassandra.thrift.Cassandra;
 import org.apache.cassandra.thrift.InvalidRequestException;
 import org.apache.cassandra.transport.SimpleClient;
@@ -40,8 +42,11 @@ public class StressSettings implements Serializable
 {
     public final SettingsCommand command;
     public final SettingsRate rate;
-    public final SettingsKey keys;
+    public final SettingsPopulation generate;
+    public final SettingsInsert insert;
     public final SettingsColumn columns;
+    public final SettingsSamples samples;
+    public final SettingsErrors errors;
     public final SettingsLog log;
     public final SettingsMode mode;
     public final SettingsNode node;
@@ -49,13 +54,31 @@ public class StressSettings implements Serializable
     public final SettingsTransport transport;
     public final SettingsPort port;
     public final String sendToDaemon;
+    public final SettingsGraph graph;
 
-    public StressSettings(SettingsCommand command, SettingsRate rate, SettingsKey keys, SettingsColumn columns, SettingsLog log, SettingsMode mode, SettingsNode node, SettingsSchema schema, SettingsTransport transport, SettingsPort port, String sendToDaemon)
+    public StressSettings(SettingsCommand command,
+                          SettingsRate rate,
+                          SettingsPopulation generate,
+                          SettingsInsert insert,
+                          SettingsColumn columns,
+                          SettingsSamples samples,
+                          SettingsErrors errors,
+                          SettingsLog log,
+                          SettingsMode mode,
+                          SettingsNode node,
+                          SettingsSchema schema,
+                          SettingsTransport transport,
+                          SettingsPort port,
+                          String sendToDaemon,
+                          SettingsGraph graph)
     {
         this.command = command;
         this.rate = rate;
-        this.keys = keys;
+        this.insert = insert;
+        this.generate = generate;
         this.columns = columns;
+        this.samples = samples;
+        this.errors = errors;
         this.log = log;
         this.mode = mode;
         this.node = node;
@@ -63,6 +86,7 @@ public class StressSettings implements Serializable
         this.transport = transport;
         this.port = port;
         this.sendToDaemon = sendToDaemon;
+        this.graph = graph;
     }
 
     private SmartThriftClient tclient;
@@ -122,6 +146,10 @@ public class StressSettings implements Serializable
 
             if (setKeyspace)
                 client.set_keyspace(schema.keyspace);
+
+            if (mode.username != null)
+                client.login(new AuthenticationRequest(ImmutableMap.of("username", mode.username, "password", mode.password)));
+
         }
         catch (InvalidRequestException e)
         {
@@ -129,7 +157,7 @@ public class StressSettings implements Serializable
         }
         catch (Exception e)
         {
-            throw new RuntimeException(e.getMessage());
+            throw new RuntimeException(e);
         }
 
         return client;
@@ -173,7 +201,7 @@ public class StressSettings implements Serializable
                     return client;
 
                 EncryptionOptions.ClientEncryptionOptions encOptions = transport.getEncryptionOptions();
-                JavaDriverClient c = new JavaDriverClient(currentNode, port.nativePort, encOptions);
+                JavaDriverClient c = new JavaDriverClient(this, currentNode, port.nativePort, encOptions);
                 c.connect(mode.compression());
                 if (setKeyspace)
                     c.execute("USE \"" + schema.keyspace + "\";", org.apache.cassandra.db.ConsistencyLevel.ONE);
@@ -189,15 +217,17 @@ public class StressSettings implements Serializable
 
     public void maybeCreateKeyspaces()
     {
-        if (command.type == Command.WRITE || command.type == Command.COUNTER_WRITE || command.type == Command.USER)
+        if (command.type == Command.WRITE || command.type == Command.COUNTER_WRITE)
             schema.createKeySpaces(this);
-
+        else if (command.type == Command.USER)
+            ((SettingsCommandUser) command).profile.maybeCreateSchema(this);
     }
 
     public static StressSettings parse(String[] args)
     {
         try
         {
+            args = repairParams(args);
             final Map<String, String[]> clArgs = parseMap(args);
             if (clArgs.containsKey("legacy"))
                 return Legacy.build(Arrays.copyOfRange(args, 1, args.length));
@@ -213,6 +243,23 @@ public class StressSettings implements Serializable
         }
     }
 
+    private static String[] repairParams(String[] args)
+    {
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        for (String arg : args)
+        {
+            if (!first)
+                sb.append(" ");
+            sb.append(arg);
+            first = false;
+        }
+        return sb.toString()
+                 .replaceAll("\\s+([,=()])", "$1")
+                 .replaceAll("([,=(])\\s+", "$1")
+                 .split(" +");
+    }
+
     public static StressSettings get(Map<String, String[]> clArgs)
     {
         SettingsCommand command = SettingsCommand.get(clArgs);
@@ -221,13 +268,17 @@ public class StressSettings implements Serializable
         String sendToDaemon = SettingsMisc.getSendToDaemon(clArgs);
         SettingsPort port = SettingsPort.get(clArgs);
         SettingsRate rate = SettingsRate.get(clArgs, command);
-        SettingsKey keys = SettingsKey.get(clArgs, command);
+        SettingsPopulation generate = SettingsPopulation.get(clArgs, command);
+        SettingsInsert insert = SettingsInsert.get(clArgs);
         SettingsColumn columns = SettingsColumn.get(clArgs);
+        SettingsSamples samples = SettingsSamples.get(clArgs);
+        SettingsErrors errors = SettingsErrors.get(clArgs);
         SettingsLog log = SettingsLog.get(clArgs);
         SettingsMode mode = SettingsMode.get(clArgs);
         SettingsNode node = SettingsNode.get(clArgs);
         SettingsSchema schema = SettingsSchema.get(clArgs, command);
         SettingsTransport transport = SettingsTransport.get(clArgs);
+        SettingsGraph graph = SettingsGraph.get(clArgs, command);
         if (!clArgs.isEmpty())
         {
             printHelp();
@@ -244,7 +295,8 @@ public class StressSettings implements Serializable
             }
             System.exit(1);
         }
-        return new StressSettings(command, rate, keys, columns, log, mode, node, schema, transport, port, sendToDaemon);
+
+        return new StressSettings(command, rate, generate, insert, columns, samples, errors, log, mode, node, schema, transport, port, sendToDaemon, graph);
     }
 
     private static Map<String, String[]> parseMap(String[] args)

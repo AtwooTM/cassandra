@@ -22,13 +22,16 @@ import java.io.IOException;
 import java.util.UUID;
 
 import org.apache.commons.lang3.StringUtils;
+import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 public class DescriptorTest
 {
@@ -74,24 +77,19 @@ public class DescriptorTest
     private void testFromFilenameFor(File dir)
     {
         // normal
-        checkFromFilename(new Descriptor(dir, ksname, cfname, 1, Descriptor.Type.FINAL), false);
+        checkFromFilename(new Descriptor(dir, ksname, cfname, 1), false);
         // skip component (for streaming lock file)
-        checkFromFilename(new Descriptor(dir, ksname, cfname, 2, Descriptor.Type.FINAL), true);
-        // tmp
-        checkFromFilename(new Descriptor(dir, ksname, cfname, 3, Descriptor.Type.TEMP), false);
+        checkFromFilename(new Descriptor(dir, ksname, cfname, 2), true);
+
         // secondary index
         String idxName = "myidx";
         File idxDir = new File(dir.getAbsolutePath() + File.separator + Directories.SECONDARY_INDEX_NAME_SEPARATOR + idxName);
-        checkFromFilename(new Descriptor(idxDir, ksname, cfname + Directories.SECONDARY_INDEX_NAME_SEPARATOR + idxName, 4, Descriptor.Type.FINAL), false);
-        // secondary index tmp
-        checkFromFilename(new Descriptor(idxDir, ksname, cfname + Directories.SECONDARY_INDEX_NAME_SEPARATOR + idxName, 5, Descriptor.Type.TEMP), false);
+        checkFromFilename(new Descriptor(idxDir, ksname, cfname + Directories.SECONDARY_INDEX_NAME_SEPARATOR + idxName, 4), false);
 
         // legacy version
-        checkFromFilename(new Descriptor("ja", dir, ksname, cfname, 1, Descriptor.Type.FINAL), false);
-        // legacy tmp
-        checkFromFilename(new Descriptor("ja", dir, ksname, cfname, 2, Descriptor.Type.TEMP), false);
+        checkFromFilename(new Descriptor("ja", dir, ksname, cfname, 1, SSTableFormat.Type.LEGACY), false);
         // legacy secondary index
-        checkFromFilename(new Descriptor("ja", dir, ksname, cfname + Directories.SECONDARY_INDEX_NAME_SEPARATOR + idxName, 3, Descriptor.Type.FINAL), false);
+        checkFromFilename(new Descriptor("ja", dir, ksname, cfname + Directories.SECONDARY_INDEX_NAME_SEPARATOR + idxName, 3, SSTableFormat.Type.LEGACY), false);
     }
 
     private void checkFromFilename(Descriptor original, boolean skipComponent)
@@ -106,7 +104,6 @@ public class DescriptorTest
         assertEquals(original.cfname, desc.cfname);
         assertEquals(original.version, desc.version);
         assertEquals(original.generation, desc.generation);
-        assertEquals(original.type, desc.type);
 
         if (skipComponent)
         {
@@ -117,4 +114,48 @@ public class DescriptorTest
             assertEquals(Component.DATA.name(), pair.right);
         }
     }
+
+    @Test
+    public void validateNames()
+    {
+
+        String names[] = {
+            /*"system-schema_keyspaces-ka-1-CompressionInfo.db",  "system-schema_keyspaces-ka-1-Summary.db",
+            "system-schema_keyspaces-ka-1-Data.db",             "system-schema_keyspaces-ka-1-TOC.txt",
+            "system-schema_keyspaces-ka-1-Digest.sha1",         "system-schema_keyspaces-ka-2-CompressionInfo.db",
+            "system-schema_keyspaces-ka-1-Filter.db",           "system-schema_keyspaces-ka-2-Data.db",
+            "system-schema_keyspaces-ka-1-Index.db",            "system-schema_keyspaces-ka-2-Digest.sha1",
+            "system-schema_keyspaces-ka-1-Statistics.db",
+            "system-schema_keyspacest-tmp-ka-1-Data.db",*/
+            "system-schema_keyspace-ka-1-"+ SSTableFormat.Type.BIG.name+"-Data.db"
+        };
+
+        for (String name : names)
+        {
+            Descriptor d = Descriptor.fromFilename(name);
+        }
+    }
+
+    @Test
+    public void badNames()
+    {
+        String names[] = {
+                "system-schema_keyspaces-k234a-1-CompressionInfo.db",  "system-schema_keyspaces-ka-aa-Summary.db",
+                "system-schema_keyspaces-XXX-ka-1-Data.db",             "system-schema_keyspaces-k",
+                "system-schema_keyspace-ka-1-AAA-Data.db",  "system-schema-keyspace-ka-1-AAA-Data.db"
+        };
+
+        for (String name : names)
+        {
+            try
+            {
+                Descriptor d = Descriptor.fromFilename(name);
+                Assert.fail(name);
+            } catch (Throwable e) {
+                //good
+            }
+        }
+    }
+
+
 }

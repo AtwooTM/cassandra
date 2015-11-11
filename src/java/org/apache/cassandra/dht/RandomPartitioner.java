@@ -22,11 +22,14 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.db.BufferDecoratedKey;
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.db.CachedHashDecoratedKey;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.db.marshal.PartitionerDefinedOrder;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.GuidGenerator;
@@ -36,17 +39,20 @@ import org.apache.cassandra.utils.Pair;
 /**
  * This class generates a BigIntegerToken using MD5 hash.
  */
-public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
+public class RandomPartitioner implements IPartitioner
 {
     public static final BigInteger ZERO = new BigInteger("0");
     public static final BigIntegerToken MINIMUM = new BigIntegerToken("-1");
     public static final BigInteger MAXIMUM = new BigInteger("2").pow(127);
 
-    private static final int EMPTY_SIZE = (int) ObjectSizes.measureDeep(new BigIntegerToken(FBUtilities.hashToBigInteger(ByteBuffer.allocate(1))));
+    private static final int HEAP_SIZE = (int) ObjectSizes.measureDeep(new BigIntegerToken(FBUtilities.hashToBigInteger(ByteBuffer.allocate(1))));
+
+    public static final RandomPartitioner instance = new RandomPartitioner();
+    public static final AbstractType<?> partitionOrdering = new PartitionerDefinedOrder(instance);
 
     public DecoratedKey decorateKey(ByteBuffer key)
     {
-        return new BufferDecoratedKey(getToken(key), key);
+        return new CachedHashDecoratedKey(getToken(key), key);
     }
 
     public Token midpoint(Token ltoken, Token rtoken)
@@ -72,19 +78,21 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
         return new BigIntegerToken(token);
     }
 
-    private final Token.TokenFactory<BigInteger> tokenFactory = new Token.TokenFactory<BigInteger>() {
-        public ByteBuffer toByteArray(Token<BigInteger> bigIntegerToken)
+    private final Token.TokenFactory tokenFactory = new Token.TokenFactory() {
+        public ByteBuffer toByteArray(Token token)
         {
+            BigIntegerToken bigIntegerToken = (BigIntegerToken) token;
             return ByteBuffer.wrap(bigIntegerToken.token.toByteArray());
         }
 
-        public Token<BigInteger> fromByteArray(ByteBuffer bytes)
+        public Token fromByteArray(ByteBuffer bytes)
         {
             return new BigIntegerToken(new BigInteger(ByteBufferUtil.getArray(bytes)));
         }
 
-        public String toString(Token<BigInteger> bigIntegerToken)
+        public String toString(Token token)
         {
+            BigIntegerToken bigIntegerToken = (BigIntegerToken) token;
             return bigIntegerToken.token.toString();
         }
 
@@ -104,13 +112,13 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
             }
         }
 
-        public Token<BigInteger> fromString(String string)
+        public Token fromString(String string)
         {
             return new BigIntegerToken(new BigInteger(string));
         }
     };
 
-    public Token.TokenFactory<BigInteger> getTokenFactory()
+    public Token.TokenFactory getTokenFactory()
     {
         return tokenFactory;
     }
@@ -120,16 +128,39 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
         return false;
     }
 
+    public static class BigIntegerToken extends ComparableObjectToken<BigInteger>
+    {
+        static final long serialVersionUID = -5833589141319293006L;
+
+        public BigIntegerToken(BigInteger token)
+        {
+            super(token);
+        }
+
+        // convenience method for testing
+        @VisibleForTesting
+        public BigIntegerToken(String token) {
+            this(new BigInteger(token));
+        }
+
+        @Override
+        public IPartitioner getPartitioner()
+        {
+            return instance;
+        }
+
+        @Override
+        public long getHeapSize()
+        {
+            return HEAP_SIZE;
+        }
+    }
+
     public BigIntegerToken getToken(ByteBuffer key)
     {
         if (key.remaining() == 0)
             return MINIMUM;
         return new BigIntegerToken(FBUtilities.hashToBigInteger(key));
-    }
-
-    public long getHeapSizeOf(BigIntegerToken token)
-    {
-        return EMPTY_SIZE;
     }
 
     public Map<Token, Float> describeOwnership(List<Token> sortedTokens)
@@ -166,5 +197,10 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
     public AbstractType<?> getTokenValidator()
     {
         return IntegerType.instance;
+    }
+
+    public AbstractType<?> partitionOrdering()
+    {
+        return partitionOrdering;
     }
 }

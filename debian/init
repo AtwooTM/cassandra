@@ -21,6 +21,7 @@ SCRIPTNAME=/etc/init.d/$NAME
 CONFDIR=/etc/cassandra
 WAIT_FOR_START=10
 CASSANDRA_HOME=/usr/share/cassandra
+CASSANDRA_CONF=$CONFDIR
 FD_LIMIT=100000
 
 [ -e /usr/share/cassandra/apache-cassandra.jar ] || exit 0
@@ -29,14 +30,6 @@ FD_LIMIT=100000
 
 # Read configuration variable file if it is present
 [ -r /etc/default/$NAME ] && . /etc/default/$NAME
-
-# Read Cassandra environment file.
-. /etc/cassandra/cassandra-env.sh
-
-if [ -z "$JVM_OPTS" ]; then
-    echo "Initialization failed; \$JVM_OPTS not set!" >&2
-    exit 3
-fi
 
 # Export JAVA_HOME, if set.
 [ -n "$JAVA_HOME" ] && export JAVA_HOME
@@ -84,7 +77,7 @@ do_start()
     error_log_f="$cassandra_home/hs_err_`date +%s`.log"
 
     [ -e `dirname "$PIDFILE"` ] || \
-        install -d -ocassandra -gcassandra -m750 `dirname $PIDFILE`
+        install -d -ocassandra -gcassandra -m755 `dirname $PIDFILE`
 
 
 

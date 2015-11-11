@@ -22,6 +22,8 @@ import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.Pair;
 
 public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
@@ -31,32 +33,38 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
 
     public final TypeSerializer<K> keys;
     public final TypeSerializer<V> values;
+    private final Comparator<Pair<ByteBuffer, ByteBuffer>> comparator;
 
-    public static synchronized <K, V> MapSerializer<K, V> getInstance(TypeSerializer<K> keys, TypeSerializer<V> values)
+    public static synchronized <K, V> MapSerializer<K, V> getInstance(TypeSerializer<K> keys, TypeSerializer<V> values, Comparator<ByteBuffer> comparator)
     {
         Pair<TypeSerializer<?>, TypeSerializer<?>> p = Pair.<TypeSerializer<?>, TypeSerializer<?>>create(keys, values);
         MapSerializer<K, V> t = instances.get(p);
         if (t == null)
         {
-            t = new MapSerializer<K, V>(keys, values);
+            t = new MapSerializer<K, V>(keys, values, comparator);
             instances.put(p, t);
         }
         return t;
     }
 
-    private MapSerializer(TypeSerializer<K> keys, TypeSerializer<V> values)
+    private MapSerializer(TypeSerializer<K> keys, TypeSerializer<V> values, Comparator<ByteBuffer> comparator)
     {
         this.keys = keys;
         this.values = values;
+        this.comparator = (p1, p2) -> comparator.compare(p1.left, p2.left);
     }
 
     public List<ByteBuffer> serializeValues(Map<K, V> map)
     {
-        List<ByteBuffer> buffers = new ArrayList<>(map.size() * 2);
+        List<Pair<ByteBuffer, ByteBuffer>> pairs = new ArrayList<>(map.size());
         for (Map.Entry<K, V> entry : map.entrySet())
+            pairs.add(Pair.create(keys.serialize(entry.getKey()), values.serialize(entry.getValue())));
+        Collections.sort(pairs, comparator);
+        List<ByteBuffer> buffers = new ArrayList<>(pairs.size() * 2);
+        for (Pair<ByteBuffer, ByteBuffer> p : pairs)
         {
-            buffers.add(keys.serialize(entry.getKey()));
-            buffers.add(values.serialize(entry.getValue()));
+            buffers.add(p.left);
+            buffers.add(p.right);
         }
         return buffers;
     }
@@ -77,10 +85,12 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
                 keys.validate(readValue(input, version));
                 values.validate(readValue(input, version));
             }
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after map value");
         }
         catch (BufferUnderflowException e)
         {
-            throw new MarshalException("Not enough bytes to read a set");
+            throw new MarshalException("Not enough bytes to read a map");
         }
     }
 
@@ -101,7 +111,41 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
 
                 m.put(keys.deserialize(kbb), values.deserialize(vbb));
             }
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after map value");
             return m;
+        }
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a map");
+        }
+    }
+
+    /**
+     * Given a serialized map, gets the value associated with a given key.
+     * @param serializedMap a serialized map
+     * @param serializedKey a serialized key
+     * @param keyType the key type for the map
+     * @return the value associated with the key if one exists, null otherwise
+     */
+    public ByteBuffer getSerializedValue(ByteBuffer serializedMap, ByteBuffer serializedKey, AbstractType keyType)
+    {
+        try
+        {
+            ByteBuffer input = serializedMap.duplicate();
+            int n = readCollectionSize(input, Server.VERSION_3);
+            for (int i = 0; i < n; i++)
+            {
+                ByteBuffer kbb = readValue(input, Server.VERSION_3);
+                ByteBuffer vbb = readValue(input, Server.VERSION_3);
+                int comparison = keyType.compare(kbb, serializedKey);
+                if (comparison == 0)
+                    return vbb;
+                else if (comparison > 0)
+                    // since the map is in sorted order, we know we've gone too far and the element doesn't exist
+                    return null;
+            }
+            return null;
         }
         catch (BufferUnderflowException e)
         {
@@ -112,23 +156,19 @@ public class MapSerializer<K, V> extends CollectionSerializer<Map<K, V>>
     public String toString(Map<K, V> value)
     {
         StringBuilder sb = new StringBuilder();
+        sb.append('{');
         boolean isFirst = true;
         for (Map.Entry<K, V> element : value.entrySet())
         {
             if (isFirst)
-            {
                 isFirst = false;
-            }
             else
-            {
-                sb.append("; ");
-            }
-            sb.append('(');
+                sb.append(", ");
             sb.append(keys.toString(element.getKey()));
-            sb.append(", ");
+            sb.append(": ");
             sb.append(values.toString(element.getValue()));
-            sb.append(')');
         }
+        sb.append('}');
         return sb.toString();
     }
 

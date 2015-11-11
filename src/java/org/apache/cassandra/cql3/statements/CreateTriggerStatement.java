@@ -22,11 +22,13 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.TriggerDefinition;
 import org.apache.cassandra.cql3.CFName;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.schema.TriggerMetadata;
+import org.apache.cassandra.schema.Triggers;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.thrift.ThriftValidation;
@@ -39,12 +41,14 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
 
     private final String triggerName;
     private final String triggerClass;
+    private final boolean ifNotExists;
 
-    public CreateTriggerStatement(CFName name, String triggerName, String clazz)
+    public CreateTriggerStatement(CFName name, String triggerName, String clazz, boolean ifNotExists)
     {
         super(name);
         this.triggerName = triggerName;
         this.triggerClass = clazz;
+        this.ifNotExists = ifNotExists;
     }
 
     public void checkAccess(ClientState state) throws UnauthorizedException
@@ -54,7 +58,10 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
 
     public void validate(ClientState state) throws RequestValidationException
     {
-        ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
+        CFMetaData cfm = ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
+        if (cfm.isView())
+            throw new InvalidRequestException("Cannot CREATE TRIGGER against a materialized view");
+
         try
         {
             TriggerExecutor.instance.loadTriggerInstance(triggerClass);
@@ -65,12 +72,23 @@ public class CreateTriggerStatement extends SchemaAlteringStatement
         }
     }
 
-    public void announceMigration(boolean isLocalOnly) throws ConfigurationException
+    public boolean announceMigration(boolean isLocalOnly) throws ConfigurationException, InvalidRequestException
     {
         CFMetaData cfm = Schema.instance.getCFMetaData(keyspace(), columnFamily()).copy();
-        cfm.addTriggerDefinition(TriggerDefinition.create(triggerName, triggerClass));
+        Triggers triggers = cfm.getTriggers();
+
+        if (triggers.get(triggerName).isPresent())
+        {
+            if (ifNotExists)
+                return false;
+            else
+                throw new InvalidRequestException(String.format("Trigger %s already exists", triggerName));
+        }
+
+        cfm.triggers(triggers.with(TriggerMetadata.create(triggerName, triggerClass)));
         logger.info("Adding trigger with name {} and class {}", triggerName, triggerClass);
         MigrationManager.announceColumnFamilyUpdate(cfm, false, isLocalOnly);
+        return true;
     }
 
     public Event.SchemaChange changeEvent()

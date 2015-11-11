@@ -21,24 +21,14 @@ import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.UUID;
 
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+
 public interface IMutation
 {
     public String getKeyspaceName();
     public Collection<UUID> getColumnFamilyIds();
-    public ByteBuffer key();
+    public DecoratedKey key();
     public long getTimeout();
     public String toString(boolean shallow);
-    public void addAll(IMutation m);
-    public Collection<ColumnFamily> getColumnFamilies();
-
-    /**
-     * Call to increment underlying network buffer refcount
-     * So we can avoid recycling too soon
-     */
-    public void retain();
-
-    /**
-     * Call to decrement underlying network buffer refcount
-     */
-    public void release();
+    public Collection<PartitionUpdate> getPartitionUpdates();
 }

@@ -25,18 +25,28 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.cassandra.stress.generate.*;
+import com.google.common.base.Function;
 import org.apache.commons.math3.distribution.ExponentialDistribution;
 import org.apache.commons.math3.distribution.NormalDistribution;
 import org.apache.commons.math3.distribution.UniformRealDistribution;
 import org.apache.commons.math3.distribution.WeibullDistribution;
 import org.apache.commons.math3.random.JDKRandomGenerator;
 
+import org.apache.cassandra.stress.generate.*;
+
 /**
  * For selecting a mathematical distribution
  */
 public class OptionDistribution extends Option
 {
+
+    public static final Function<String, DistributionFactory> BUILDER = new Function<String, DistributionFactory>()
+    {
+        public DistributionFactory apply(String s)
+        {
+            return get(s);
+        }
+    };
 
     private static final Pattern FULL = Pattern.compile("(~?)([A-Z]+)\\((.+)\\)", Pattern.CASE_INSENSITIVE);
     private static final Pattern ARGS = Pattern.compile("[^,]+");
@@ -45,12 +55,19 @@ public class OptionDistribution extends Option
     private String spec;
     private final String defaultSpec;
     private final String description;
+    private final boolean required;
 
     public OptionDistribution(String prefix, String defaultSpec, String description)
+    {
+        this(prefix, defaultSpec, description, defaultSpec == null);
+    }
+
+    public OptionDistribution(String prefix, String defaultSpec, String description, boolean required)
     {
         this.prefix = prefix;
         this.defaultSpec = defaultSpec;
         this.description = description;
+        this.required = required;
     }
 
     @Override
@@ -82,13 +99,13 @@ public class OptionDistribution extends Option
 
     public DistributionFactory get()
     {
-        return spec != null ? get(spec) : get(defaultSpec);
+        return spec != null ? get(spec) : defaultSpec != null ? get(defaultSpec) : null;
     }
 
     @Override
     public boolean happy()
     {
-        return spec != null || defaultSpec != null;
+        return !required || spec != null;
     }
 
     public String longDisplay()
@@ -102,18 +119,24 @@ public class OptionDistribution extends Option
         return Arrays.asList(
                 GroupedOptions.formatMultiLine("EXP(min..max)", "An exponential distribution over the range [min..max]"),
                 GroupedOptions.formatMultiLine("EXTREME(min..max,shape)", "An extreme value (Weibull) distribution over the range [min..max]"),
+                GroupedOptions.formatMultiLine("QEXTREME(min..max,shape,quantas)", "An extreme value, split into quantas, within which the chance of selection is uniform"),
                 GroupedOptions.formatMultiLine("GAUSSIAN(min..max,stdvrng)", "A gaussian/normal distribution, where mean=(min+max)/2, and stdev is (mean-min)/stdvrng"),
                 GroupedOptions.formatMultiLine("GAUSSIAN(min..max,mean,stdev)", "A gaussian/normal distribution, with explicitly defined mean and stdev"),
                 GroupedOptions.formatMultiLine("UNIFORM(min..max)", "A uniform distribution over the range [min, max]"),
                 GroupedOptions.formatMultiLine("FIXED(val)", "A fixed distribution, always returning the same value"),
                 "Preceding the name with ~ will invert the distribution, e.g. ~exp(1..10) will yield 10 most, instead of least, often",
-                "Aliases: extr, gauss, normal, norm, weibull"
+                "Aliases: extr, qextr, gauss, normal, norm, weibull"
         );
     }
 
     boolean setByUser()
     {
         return spec != null;
+    }
+
+    boolean present()
+    {
+        return setByUser() || defaultSpec != null;
     }
 
     @Override
@@ -128,7 +151,9 @@ public class OptionDistribution extends Option
         final Map<String, Impl> lookup = new HashMap<>();
         lookup.put("exp", new ExponentialImpl());
         lookup.put("extr", new ExtremeImpl());
-        lookup.put("extreme", lookup.get("extreme"));
+        lookup.put("qextr", new QuantizedExtremeImpl());
+        lookup.put("extreme", lookup.get("extr"));
+        lookup.put("qextreme", lookup.get("qextr"));
         lookup.put("weibull", lookup.get("weibull"));
         lookup.put("gaussian", new GaussianImpl());
         lookup.put("normal", lookup.get("gaussian"));
@@ -188,8 +213,10 @@ public class OptionDistribution extends Option
                     mean = (min + max) / 2d;
                     stdev = ((max - min) / 2d) / stdevsToEdge;
                 }
+                if (min == max)
+                    return new FixedFactory(min);
                 return new GaussianFactory(min, max, mean, stdev);
-            } catch (Exception e)
+            } catch (Exception ignore)
             {
                 throw new IllegalArgumentException("Invalid parameter list for uniform distribution: " + params);
             }
@@ -208,12 +235,14 @@ public class OptionDistribution extends Option
                 String[] bounds = params.get(0).split("\\.\\.+");
                 final long min = parseLong(bounds[0]);
                 final long max = parseLong(bounds[1]);
+                if (min == max)
+                    return new FixedFactory(min);
                 ExponentialDistribution findBounds = new ExponentialDistribution(1d);
                 // max probability should be roughly equal to accuracy of (max-min) to ensure all values are visitable,
                 // over entire range, but this results in overly skewed distribution, so take sqrt
                 final double mean = (max - min) / findBounds.inverseCumulativeProbability(1d - Math.sqrt(1d/(max-min)));
                 return new ExpFactory(min, max, mean);
-            } catch (Exception e)
+            } catch (Exception ignore)
             {
                 throw new IllegalArgumentException("Invalid parameter list for uniform distribution: " + params);
             }
@@ -232,15 +261,45 @@ public class OptionDistribution extends Option
                 String[] bounds = params.get(0).split("\\.\\.+");
                 final long min = parseLong(bounds[0]);
                 final long max = parseLong(bounds[1]);
+                if (min == max)
+                    return new FixedFactory(min);
                 final double shape = Double.parseDouble(params.get(1));
                 WeibullDistribution findBounds = new WeibullDistribution(shape, 1d);
                 // max probability should be roughly equal to accuracy of (max-min) to ensure all values are visitable,
                 // over entire range, but this results in overly skewed distribution, so take sqrt
                 final double scale = (max - min) / findBounds.inverseCumulativeProbability(1d - Math.sqrt(1d/(max-min)));
                 return new ExtremeFactory(min, max, shape, scale);
-            } catch (Exception e)
+            } catch (Exception ignore)
             {
                 throw new IllegalArgumentException("Invalid parameter list for extreme (Weibull) distribution: " + params);
+            }
+        }
+    }
+
+    private static final class QuantizedExtremeImpl implements Impl
+    {
+        @Override
+        public DistributionFactory getFactory(List<String> params)
+        {
+            if (params.size() != 3)
+                throw new IllegalArgumentException("Invalid parameter list for quantized extreme (Weibull) distribution: " + params);
+            try
+            {
+                String[] bounds = params.get(0).split("\\.\\.+");
+                final long min = parseLong(bounds[0]);
+                final long max = parseLong(bounds[1]);
+                final double shape = Double.parseDouble(params.get(1));
+                final int quantas = Integer.parseInt(params.get(2));
+                WeibullDistribution findBounds = new WeibullDistribution(shape, 1d);
+                // max probability should be roughly equal to accuracy of (max-min) to ensure all values are visitable,
+                // over entire range, but this results in overly skewed distribution, so take sqrt
+                final double scale = (max - min) / findBounds.inverseCumulativeProbability(1d - Math.sqrt(1d/(max-min)));
+                if (min == max)
+                    return new FixedFactory(min);
+                return new QuantizedExtremeFactory(min, max, shape, scale, quantas);
+            } catch (Exception ignore)
+            {
+                throw new IllegalArgumentException("Invalid parameter list for quantized extreme (Weibull) distribution: " + params);
             }
         }
     }
@@ -258,8 +317,10 @@ public class OptionDistribution extends Option
                 String[] bounds = params.get(0).split("\\.\\.+");
                 final long min = parseLong(bounds[0]);
                 final long max = parseLong(bounds[1]);
+                if (min == max)
+                    return new FixedFactory(min);
                 return new UniformFactory(min, max);
-            } catch (Exception e)
+            } catch (Exception ignore)
             {
                 throw new IllegalArgumentException("Invalid parameter list for uniform distribution: " + params);
             }
@@ -278,7 +339,7 @@ public class OptionDistribution extends Option
             {
                 final long key = parseLong(params.get(0));
                 return new FixedFactory(key);
-            } catch (Exception e)
+            } catch (Exception ignore)
             {
                 throw new IllegalArgumentException("Invalid parameter list for uniform distribution: " + params);
             }
@@ -319,7 +380,7 @@ public class OptionDistribution extends Option
         }
     }
 
-    private static final class ExtremeFactory implements DistributionFactory
+    private static class ExtremeFactory implements DistributionFactory
     {
         final long min, max;
         final double shape, scale;
@@ -335,6 +396,22 @@ public class OptionDistribution extends Option
         public Distribution get()
         {
             return new DistributionOffsetApache(new WeibullDistribution(new JDKRandomGenerator(), shape, scale, WeibullDistribution.DEFAULT_INVERSE_ABSOLUTE_ACCURACY), min, max);
+        }
+    }
+
+    private static final class QuantizedExtremeFactory extends ExtremeFactory
+    {
+        final int quantas;
+        private QuantizedExtremeFactory(long min, long max, double shape, double scale, int quantas)
+        {
+            super(min, max, shape, scale);
+            this.quantas = quantas;
+        }
+
+        @Override
+        public Distribution get()
+        {
+            return new DistributionQuantized(new DistributionOffsetApache(new WeibullDistribution(new JDKRandomGenerator(), shape, scale, WeibullDistribution.DEFAULT_INVERSE_ABSOLUTE_ACCURACY), min, max), quantas);
         }
     }
 

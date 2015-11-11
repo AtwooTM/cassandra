@@ -125,7 +125,10 @@ Function KillProcess
 
                     // Must wait here. If we don't and re-enable Ctrl-C
                     // handling below too fast, we might terminate ourselves.
-                    proc.WaitForExit(2000);
+                    bool exited = proc.WaitForExit(30000);
+                    if(!exited)
+                        proc.Kill();
+
                     FreeConsole();
 
                     // Re-attach to current console to write output
@@ -137,7 +140,12 @@ Function KillProcess
                     SetConsoleCtrlHandler(null, false);
 
                     if (!silent)
-                        System.Console.WriteLine("Successfully sent ctrl+c to process with id: " + pidToKill + ".");
+                    {
+                        if(exited)
+                            System.Console.WriteLine("Successfully sent ctrl+c to process with id: " + pidToKill + ".");
+                        else
+                            System.Console.WriteLine("Process with id: " + pidToKill + " did not exit after 30 seconds, killed.");
+                    }
                 }
                 else
                 {
@@ -161,7 +169,7 @@ Function KillProcess
     $env:TMP = $oldTmp
     $env:TEMP = $oldTemp
 
-    $a = Get-Content $p
+    $pidToKill = Get-Content $p
     # If run in cygwin, we don't get the TITLE / pid combo in stop-server.bat but also don't need
     # to worry about reattaching console output as it gets stderr/stdout even after the C#/C++
     # FreeConsole calls.
@@ -170,7 +178,14 @@ Function KillProcess
         $batchpid = -1
     }
 
-    [PowerStopper.Stopper]::StopProgram($a, $batchpid, $silent)
+    if ($f)
+    {
+        taskkill /f /pid $pidToKill
+    }
+    else
+    {
+        [PowerStopper.Stopper]::StopProgram($pidToKill, $batchpid, $silent)
+    }
 }
 
 #-----------------------------------------------------------------------------
